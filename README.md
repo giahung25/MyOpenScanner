@@ -1,129 +1,130 @@
-# MyOpenScanner 📄⚡
+# MyOpenScanner
 
 [English](README.md) | [Tiếng Việt](README.vn.md)
 
-> **High-Performance Document Scanning & Searchable PDF Engine in Rust**  
-> An open-source, production-grade document scanning engine built in Rust. Transforms noisy, smartphone-captured documents (invoices, receipts, contracts) into clean, perspective-corrected, illumination-normalized, print-ready PDFs and Searchable PDFs with exact layout-preserved selectable text.
+MyOpenScanner is a document scanning engine written in Rust. It processes smartphone photographs of paper documents (invoices, receipts, waybills, contracts) into perspective-corrected, shadow-normalized, print-ready PDF and Searchable PDF files with exact visual layout preservation.
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
-* 🚀 **Blazing Fast Performance:** Implemented 100% in pure **Rust**, multi-threaded with **Rayon**, zero GIL. End-to-end processing latency of **$100\text{ms} - 350\text{ms}$** on standard multi-core CPUs.
-* 📐 **Robust 4-Corner Detection & Geometric Rectification:**
-  * Handles extreme perspective tilt (up to $35^\circ$ skew), wrinkles, and cluttered backgrounds (wooden tables, floors).
-  * Multi-pass contour detection combining **Otsu Binary Masking** and **Adaptive Canny Edges** to reliably eliminate background artifacts.
-  * Automatic Euclidean aspect ratio calculation and snapping to standard print dimensions (**A4**, **Letter**).
-  * Homography $3 \times 3$ solver with parallelized inverse bilinear perspective mapping.
-* 🎨 **CIE LAB Illumination Normalization:**
-  * Background illumination estimation on the $L^*$ (Luminance) channel via an integral fast box blur with exact boundary pixel-count correction, completely removing shadows (hands, phones, uneven lighting).
-  * **100% Legal Color Preservation:** Strictly preserves chrominance channels ($a^*, b^*$). **Red stamps/seals** ($a^* \gg 0$), **blue ink signatures** ($b^* \ll 0$), and colored carbon copy papers (yellow, pink, blue) retain their natural, vibrant tones without synthetic bleaching.
-* 🔍 **Micro-Detail & Barcode Enhancement:**
-  * Thresholded unsharp masking selectively sharpens fine printed text (6pt–8pt) and 1D/2D barcode lines while suppressing noise on flat areas and eliminating halo/ringing artifacts.
-* 📑 **DPI-Accurate & Searchable PDF Generation:**
-  * **Vector Wrapper PDF:** Embeds lossless, high-res images into 200/300 DPI vector PDF containers using `pdf-writer`.
-  * **Searchable Sandwich PDF (`-s`):** Embeds an invisible text layer (`PDF render_mode = 3`) aligned with pixel-level precision over the original document. Enables **cursor selection, clipboard copying (`Ctrl+C`), and full-text keyword search (`Ctrl+F`)** while preserving 100% of the original visual layout, paper texture, and signatures.
-  * Simultaneously exports plain text (`.txt`) and structured word-level bounding box metadata (`.json`).
+* **High Performance:** Implemented in pure Rust with multi-threaded processing via Rayon. End-to-end processing latency ranges from 100ms to 350ms per document on standard CPUs.
+* **Geometric Rectification & Corner Detection:**
+  * Detects perspective skew up to 35° on complex backgrounds (wood desks, dark tables, floors).
+  * Multi-pass contour extraction combining Otsu binary masking and adaptive Canny edges.
+  * Aspect ratio snapping to standard paper formats (A4, Letter) based on Euclidean edge measurements.
+  * Inverse bilinear perspective mapping using a 3x3 Homography solver.
+* **CIE LAB Illumination Normalization:**
+  * Background illumination estimation on the $L^*$ channel using an integral box blur with boundary pixel count correction to eliminate shadows from hands, phones, and ambient light.
+  * **Color Preservation:** Preserves chrominance channels ($a^*, b^*$). Red stamps ($a^* \gg 0$), blue ink signatures ($b^* \ll 0$), and colored carbon copy papers retain their original color without synthetic over-bleaching.
+* **Edge & Detail Enhancement:**
+  * Thresholded unsharp masking on the luminance channel.
+  * Enhances small printed text (6pt–8pt) and 1D/2D barcodes without introducing halo or ringing artifacts.
+* **Searchable PDF Generation:**
+  * **Vector Wrapper PDF:** Embeds processed images into a 300 DPI vector PDF container using `pdf-writer`.
+  * **Searchable Sandwich PDF (`-s`):** Overlays an invisible selectable text layer (`PDF render_mode = 3`) aligned with OCR bounding boxes. Allows text selection, clipboard copying, and keyword searching (`Ctrl+F`) while keeping the scanned document image and original layout intact.
+  * Exports extracted plain text (`.txt`) and word bounding box metadata (`.json`).
 
 ---
 
-## 🏗️ 5+1 Step Functional Pipeline
+## Architecture & Pipeline
 
 ```
-[Raw Smartphone Image] (.jpg, .jpeg, .png, .webp)
+[Raw Camera Image] (.jpg, .jpeg, .png, .webp)
    │
    ▼
-1. Page Detector (Multi-pass: Otsu Mask + Adaptive Canny -> Ordered 4 Corners [TL, TR, BR, BL])
+1. Page Detector (Multi-pass: Otsu Mask + Adaptive Canny -> Ordered [TL, TR, BR, BL])
    │
    ▼
-2. Geometric Rectifier (Euclidean aspect ratio, A4/Letter snap, Homography 3x3 Inverse Warp)
+2. Geometric Rectifier (Euclidean aspect ratio, A4/Letter snap, 3x3 Homography Warp)
    │
    ▼
-3. Illumination Normalizer (CIE LAB conversion, border-accurate L* shadow removal, a*/b* preservation)
+3. Illumination Normalizer (CIE LAB conversion, boundary-corrected L* normalization, a*/b* preservation)
    │
    ▼
-4. Detail Enhancer (Thresholded Unsharp Masking on L*, fine text & barcode boost, zero halo)
+4. Detail Enhancer (Thresholded Unsharp Masking on L*, stroke contrast boost)
    │
    ▼
-5. PDF Exporter (300 DPI PDF vector embedding via pdf-writer + Raster PNG/JPG + JSON log)
+5. PDF Exporter (300 DPI vector PDF embedding via pdf-writer + Raster PNG/JPG + JSON log)
    │
    ▼
 [Optional: -s / --searchable-pdf]
-6. OCR Text Overlay (Invisible text layer render_mode=3, text selection & clipboard copying)
+6. OCR Text Overlay (Invisible text layer render_mode=3 for copy/search capability)
 ```
 
 ---
 
-## 🛠️ Installation & Build
+## Installation & Build
 
 ### Prerequisites
-* **Rust & Cargo:** Version $\ge 1.80$ ([Install Rust](https://rustup.rs/)).
-* **Python (Optional, for Searchable PDF generation):** Version $\ge 3.10$ with dependencies:
+* Rust toolchain $\ge 1.80$ (`cargo`, `rustc`).
+* Python $\ge 3.10$ (required for Searchable PDF generation with OCR):
   ```bash
   pip install pymupdf rapidocr-onnxruntime pillow
   ```
 
-### Build from Source (Release Mode)
+### Build Binary
 ```bash
 git clone https://github.com/giahung25/MyOpenScanner.git
 cd MyOpenScanner
 
-# Compile optimized release binary
+# Build optimized release executable
 cargo build --release
 
-# Run comprehensive test suite (17 tests)
+# Run test suite
 cargo test
 ```
-The compiled binary will be located at:
+
+Binary path:
 * Windows: `target/release/my_open_scanner.exe`
 * Linux / macOS: `target/release/my_open_scanner`
 
 ---
 
-## 💻 CLI Usage Guide
+## Usage
 
-### 1. Single Document Scanning
+### 1. Single Document Processing
 ```bash
-# Standard scan (exports 300 DPI PDF and rectified high-res PNG)
+# Standard scan (exports 300 DPI vector PDF and rectified PNG)
 my_open_scanner -i invoice.jpg -o ./output --format both --dpi 300
 
-# Scan & Generate Searchable PDF (cursor-selectable text, copyable, searchable)
+# Searchable scan (creates PDF with copyable text and plain text export)
 my_open_scanner -i document.png -o ./output -s --dpi 300
 ```
 
-### 2. Multi-Threaded Batch Scanning (Rayon Parallelism)
+### 2. Batch Processing
 ```bash
-# Scan an entire directory of documents concurrently across all CPU cores
+# Concurrently process all images in a folder across CPU cores
 my_open_scanner -b ./invoices -o ./output -s --dpi 300
 ```
 
-### 3. Command-Line Options
-| Option | Short | Default | Description |
+### 3. CLI Options
+| Flag | Short | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `--input <FILE>` | `-i` | *None* | Path to a single input image. |
-| `--batch-dir <DIR>` | `-b` | *None* | Path to directory containing images for batch processing. |
-| `--output-dir <DIR>` | `-o` | `./output` | Output directory for scanned documents. |
-| `--dpi <DPI>` | | `300` | Target PDF DPI ($200$ or $300$). |
+| `--input <FILE>` | `-i` | None | Path to input document image. |
+| `--batch-dir <DIR>` | `-b` | None | Directory of images for multi-threaded batch processing. |
+| `--output-dir <DIR>` | `-o` | `./output` | Output destination directory. |
+| `--dpi <DPI>` | | `300` | Target PDF resolution (200 or 300 DPI). |
 | `--format <FMT>` | | `both` | Output format: `pdf`, `png`, `jpg`, `both`. |
-| `--target-luminance <0-255>`| | `230` | Target background luminance (0-255). |
-| `--searchable-pdf` | `-s` | `false` | Enable OCR to create a Searchable PDF with selectable text. |
+| `--target-luminance <0-255>`| | `230` | Target paper background luminance. |
+| `--searchable-pdf` | `-s` | `false` | Generate searchable PDF with selectable text layer. |
 
 ---
 
-## 📊 Output Artifacts
+## Output Artifacts
 
-Each document scan generates a standardized set of artifacts in the output directory:
+For an input file named `document.png`, the pipeline outputs:
 ```
 output/
-├── document_scanned.pdf             # Standard 300 DPI vector PDF document
-├── document_scanned_searchable.pdf  # Searchable PDF with copyable & searchable text layer
-├── document_scanned.png             # Rectified and normalized high-res image
-├── document_scanned_text.txt        # Full extracted plain text with layout preservation
-├── document_scanned_ocr.json        # Detailed word-level bounding boxes and confidence scores
-└── document_scanned.json            # Structured pipeline JSON metadata log
+├── document_scanned.pdf             # Standard 300 DPI vector PDF
+├── document_scanned_searchable.pdf  # Searchable PDF with selectable text
+├── document_scanned.png             # Rectified high-resolution image
+├── document_scanned_text.txt        # Extracted plain text
+├── document_scanned_ocr.json        # OCR bounding boxes and confidence scores
+└── document_scanned.json            # Pipeline execution metadata
 ```
 
-### Data Contract (JSON Metadata Log)
+### Metadata Schema
 ```json
 {
   "file_name": "don_xin_xac_nhan.png",
@@ -147,16 +148,15 @@ output/
 
 ---
 
-## 📚 Technical Documentation
+## Technical Documentation
 
-Detailed architectural and mathematical specifications are available in the [`docs/`](docs/) directory:
-* 📐 [Architecture Documentation](docs/architecture.md): 5-module pipeline design, invariants, and dataflow.
-* 🧮 [Algorithms Specification](docs/algorithms.md): Mathematical formulations for Convex Quad detection, Homography $3\times3$, LAB Integral Box Blur, Thresholded Unsharp Masking, and PDF coordinate transformations.
-* 📝 [Data Contract](docs/data_contract.md): JSON schema specifications, CLI parameter interfaces, status codes, and error codes.
-* 🧪 [Benchmark & QA Guidelines](docs/benchmark_and_qa.md): Edge-case test suites and latency measurement methodologies.
+Detailed specifications are maintained in [`docs/`](docs/):
+* [Architecture Documentation](docs/architecture.md): Module decomposition and dataflow invariants.
+* [Algorithms Specification](docs/algorithms.md): Formulations for Homography, LAB illumination modeling, and unsharp masking.
+* [Data Contract](docs/data_contract.md): JSON schema definitions, CLI parameters, and exit codes.
+* [Benchmark & QA Guidelines](docs/benchmark_and_qa.md): Latency test cases and boundary conditions.
 
 ---
 
-## ⚖️ License
-This project is open-source and released under the MIT License.  
-Contributions, issues, and pull requests are welcome at [giahung25/MyOpenScanner](https://github.com/giahung25/MyOpenScanner).
+## License
+MIT License. Hosted at [github.com/giahung25/MyOpenScanner](https://github.com/giahung25/MyOpenScanner).
