@@ -168,9 +168,6 @@ pub fn fast_box_blur(channel: &[f32], w: u32, h: u32, radius: u32) -> Vec<f32> {
     let w = w as usize;
     let h = h as usize;
     let r = radius as usize;
-    let diam = 2 * r + 1;
-    let area = (diam * diam) as f32;
-
     // Integral image
     let mut integral = vec![0.0f32; (w + 1) * (h + 1)];
     for y in 0..h {
@@ -193,8 +190,8 @@ pub fn fast_box_blur(channel: &[f32], w: u32, h: u32, radius: u32) -> Vec<f32> {
                 - integral[y1 * (w + 1) + x2]
                 - integral[y2 * (w + 1) + x1]
                 + integral[y1 * (w + 1) + x1];
-
-            out[y * w + x] = sum / area;
+            let count = ((y2 - y1) * (x2 - x1)) as f32;
+            out[y * w + x] = sum / count;
         }
     }
     out
