@@ -1,4 +1,4 @@
-use image::{GrayImage, RgbImage};
+use image::{GrayImage, Luma, RgbImage};
 use imageproc::contours::find_contours;
 use imageproc::distance_transform::Norm;
 use imageproc::edges::canny;
@@ -10,6 +10,11 @@ use crate::models::{DocumentCorners, PipelineConfig, ScanStatus};
 
 /// Module 1: Page Detector
 /// Nhận diện trang tài liệu, tách nền và bắt 4 góc [TL, TR, BR, BL] từ ảnh chụp.
+/// Kết hợp đa kỹ thuật:
+/// - Pass 1: Otsu Binary Thresholding + Morphological Closing (tách giấy/bàn tối ưu)
+/// - Pass 2: Adaptive Thresholding (bù trừ bóng đổ mạnh)
+/// - Pass 3: Canny Edge Detection (cho tài liệu viền kẻ mảnh/độ tương phản thấp)
+/// - Fallback hierarchy: Convex Hull -> Min Area Rect -> Safe image bounds
 #[derive(Debug, Clone)]
 pub struct PageDetector {
     pub target_dim: u32,
@@ -40,7 +45,7 @@ impl PageDetector {
             return (default_corners, 0.1, ScanStatus::Fallback);
         }
 
-        // 1. Multi-scale resize về thumbnail để tăng tốc độ và giảm nhiễu cục bộ
+        // 1. Multi-scale resize về thumbnail để tăng tốc độ (< 5ms) và khử nhiễu vi mô
         let max_dim = orig_w.max(orig_h);
         let scale = if max_dim > self.target_dim {
             self.target_dim as f32 / max_dim as f32
@@ -65,30 +70,58 @@ impl PageDetector {
         // 2. Grayscale & Gaussian blur
         let gray = image::imageops::grayscale(&proc_img);
         let blurred = gaussian_blur_f32(&gray, 1.2);
-
-        // 3. Tính Otsu threshold thích ứng cho Canny edge detector
-        let (low_thresh, high_thresh) = calculate_adaptive_thresholds(&blurred);
-        let edges = canny(&blurred, low_thresh, high_thresh);
-
-        // 4. Morphological closing để nối các đường biên đứt khúc
-        let dilated = dilate(&edges, Norm::L1, 2);
-        let closed = erode(&dilated, Norm::L1, 2);
-
-        // 5. Tìm Contours
-        let contours = find_contours::<u32>(&closed);
         let total_pixels = (proc_w * proc_h) as f32;
         let min_area = total_pixels * self.min_area_ratio;
 
-        // Trích xuất các tập điểm từ contour và sắp xếp giảm dần theo diện tích
+        // Tính ngưỡng Otsu tự động
+        let otsu_thresh = calculate_otsu_threshold(&blurred);
+
+        // --- PASS 1: OTSU BINARY THRESHOLDING (Tách giấy sáng trên mặt bàn tối) ---
+        {
+            let mut binary = GrayImage::new(proc_w, proc_h);
+            for (x, y, pixel) in blurred.enumerate_pixels() {
+                let v = if pixel[0] >= otsu_thresh { 255 } else { 0 };
+                binary.put_pixel(x, y, Luma([v]));
+            }
+
+            // Morphological closing để liên kết các nét chữ/vết gãy thành khối giấy liền
+            let dilated = dilate(&binary, Norm::L1, 4);
+            let closed = erode(&dilated, Norm::L1, 4);
+
+            if let Some(corners) = self.find_quad_from_binary(&closed, proc_w, proc_h, min_area) {
+                let scaled = scale_corners_to_original(&corners, scale, orig_w, orig_h);
+                return (scaled, 0.98, ScanStatus::Success);
+            }
+        }
+
+        // --- PASS 2: ADAPTIVE THRESHOLDING (Bù trừ bóng râm gradient mạnh) ---
+        {
+            let adaptive_mask = calculate_adaptive_mask(&blurred, 15, 6);
+            let dilated = dilate(&adaptive_mask, Norm::L1, 3);
+            let closed = erode(&dilated, Norm::L1, 3);
+
+            if let Some(corners) = self.find_quad_from_binary(&closed, proc_w, proc_h, min_area) {
+                let scaled = scale_corners_to_original(&corners, scale, orig_w, orig_h);
+                return (scaled, 0.95, ScanStatus::Success);
+            }
+        }
+
+        // --- PASS 3: CANNY EDGE DETECTION (Cho nền tương phản thấp / viền kẻ) ---
+        let high_thresh = (otsu_thresh as f32).clamp(50.0, 180.0);
+        let low_thresh = (0.4 * high_thresh).max(20.0);
+        let edges = canny(&blurred, low_thresh, high_thresh);
+
+        let dilated_edges = dilate(&edges, Norm::L1, 2);
+        let closed_edges = erode(&dilated_edges, Norm::L1, 2);
+
+        let contours = find_contours::<u32>(&closed_edges);
         let mut contour_polys: Vec<Vec<Point2<f32>>> = contours
             .into_iter()
             .map(|c| {
-                let pts: Vec<Point2<f32>> = c
-                    .points
+                c.points
                     .into_iter()
                     .map(|p| Point2::new(p.x as f32, p.y as f32))
-                    .collect();
-                pts
+                    .collect()
             })
             .filter(|pts: &Vec<Point2<f32>>| pts.len() >= 4)
             .collect();
@@ -99,7 +132,6 @@ impl PageDetector {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 6. Quét tìm Contour có thể đơn giản hóa thành tứ giác lồi hợp lệ
         for poly in &contour_polys {
             let area = polygon_area(poly);
             if area < min_area {
@@ -107,48 +139,113 @@ impl PageDetector {
             }
 
             let peri = polygon_perimeter(poly);
-            // Thử nghiệm nhiều mức epsilon của Douglas-Peucker
             for &eps_factor in &[0.015, 0.02, 0.03, 0.04, 0.05] {
-                let approx = ramer_douglas_peucker(poly, eps_factor * peri);
+                let mut approx = ramer_douglas_peucker(poly, eps_factor * peri);
+                if approx.len() > 1 && (approx[0] - *approx.last().unwrap()).norm() < 15.0 {
+                    approx.pop();
+                }
                 if approx.len() == 4 && is_valid_quadrilateral(&approx, proc_w, proc_h) {
                     let corners = order_corners(&approx);
-                    let scaled_corners = scale_corners_to_original(&corners, scale, orig_w, orig_h);
-                    return (scaled_corners, 0.95, ScanStatus::Success);
+                    let scaled = scale_corners_to_original(&corners, scale, orig_w, orig_h);
+                    return (scaled, 0.90, ScanStatus::Success);
                 }
             }
         }
 
-        // 7. Fallback Cấp 1: Convex Hull của contour lớn nhất
+        // --- FALLBACK CẤP 1: Convex Hull trên contour lớn nhất ---
         if let Some(largest) = contour_polys.first() {
             if polygon_area(largest) >= min_area {
                 let hull = convex_hull(largest);
                 let peri = polygon_perimeter(&hull);
                 for &eps_factor in &[0.02, 0.03, 0.04, 0.06] {
-                    let approx = ramer_douglas_peucker(&hull, eps_factor * peri);
+                    let mut approx = ramer_douglas_peucker(&hull, eps_factor * peri);
+                    if approx.len() > 1 && (approx[0] - *approx.last().unwrap()).norm() < 15.0 {
+                        approx.pop();
+                    }
                     if approx.len() == 4 && is_valid_quadrilateral(&approx, proc_w, proc_h) {
                         let corners = order_corners(&approx);
-                        let scaled_corners =
-                            scale_corners_to_original(&corners, scale, orig_w, orig_h);
-                        return (scaled_corners, 0.80, ScanStatus::Fallback);
+                        let scaled = scale_corners_to_original(&corners, scale, orig_w, orig_h);
+                        return (scaled, 0.80, ScanStatus::Fallback);
                     }
                 }
             }
         }
 
-        // 8. Fallback Cấp 2: Min bounding box của contour lớn nhất
+        // --- FALLBACK CẤP 2: Rotated Min Bounding Box trên contour lớn nhất ---
         if let Some(largest) = contour_polys.first() {
             if polygon_area(largest) >= min_area {
-                if let Some(box_pts) = min_bounding_box(largest) {
+                if let Some(box_pts) = min_area_rect(largest) {
                     let corners = order_corners(&box_pts);
-                    let scaled_corners = scale_corners_to_original(&corners, scale, orig_w, orig_h);
-                    return (scaled_corners, 0.60, ScanStatus::Fallback);
+                    let scaled = scale_corners_to_original(&corners, scale, orig_w, orig_h);
+                    return (scaled, 0.60, ScanStatus::Fallback);
                 }
             }
         }
 
-        // 9. Fallback Cấp 3: Khung viền nội tiếp ảnh mặc định (lề an toàn 2%)
+        // --- FALLBACK CẤP 3: Khung viền nội tiếp ảnh mặc định (lề an toàn 2%) ---
         let default_corners = self.default_bounds(orig_w, orig_h);
         (default_corners, 0.35, ScanStatus::Fallback)
+    }
+
+    /// Trích xuất tứ giác lồi từ ảnh nhị phân đã lọc hình thái học
+    fn find_quad_from_binary(
+        &self,
+        binary_mask: &GrayImage,
+        proc_w: u32,
+        proc_h: u32,
+        min_area: f32,
+    ) -> Option<[Point2<f32>; 4]> {
+        let contours = find_contours::<u32>(binary_mask);
+        let mut polys: Vec<Vec<Point2<f32>>> = contours
+            .into_iter()
+            .map(|c| {
+                c.points
+                    .into_iter()
+                    .map(|p| Point2::new(p.x as f32, p.y as f32))
+                    .collect()
+            })
+            .filter(|pts: &Vec<Point2<f32>>| pts.len() >= 4)
+            .collect();
+
+        polys.sort_by(|a, b| {
+            polygon_area(b)
+                .partial_cmp(&polygon_area(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for poly in &polys {
+            let area = polygon_area(poly);
+            if area < min_area {
+                break;
+            }
+
+            // 1. Thử nghiệm RDP trực tiếp trên contour (có dedup điểm đầu-cuối của vòng khép kín)
+            let peri = polygon_perimeter(poly);
+            for &eps_factor in &[0.015, 0.02, 0.025, 0.03, 0.04, 0.05] {
+                let mut approx = ramer_douglas_peucker(poly, eps_factor * peri);
+                if approx.len() > 1 && (approx[0] - *approx.last().unwrap()).norm() < 15.0 {
+                    approx.pop();
+                }
+                if approx.len() == 4 && is_valid_quadrilateral(&approx, proc_w, proc_h) {
+                    return Some(order_corners(&approx));
+                }
+            }
+
+            // 2. Thử nghiệm RDP trên Convex Hull của contour
+            let hull = convex_hull(poly);
+            let hull_peri = polygon_perimeter(&hull);
+            for &eps_factor in &[0.02, 0.025, 0.03, 0.04, 0.05, 0.06] {
+                let mut approx = ramer_douglas_peucker(&hull, eps_factor * hull_peri);
+                if approx.len() > 1 && (approx[0] - *approx.last().unwrap()).norm() < 15.0 {
+                    approx.pop();
+                }
+                if approx.len() == 4 && is_valid_quadrilateral(&approx, proc_w, proc_h) {
+                    return Some(order_corners(&approx));
+                }
+            }
+        }
+
+        None
     }
 
     fn default_bounds(&self, w: u32, h: u32) -> DocumentCorners {
@@ -167,7 +264,7 @@ impl PageDetector {
 }
 
 /// Tính ngưỡng Otsu tự động cho ảnh xám
-fn calculate_adaptive_thresholds(gray: &GrayImage) -> (f32, f32) {
+pub fn calculate_otsu_threshold(gray: &GrayImage) -> u8 {
     let mut hist = [0u32; 256];
     let total_pixels = (gray.width() * gray.height()) as f32;
 
@@ -206,9 +303,27 @@ fn calculate_adaptive_thresholds(gray: &GrayImage) -> (f32, f32) {
         }
     }
 
-    let high = (best_thresh as f32).clamp(50.0, 180.0);
-    let low = (0.4 * high).max(20.0);
-    (low, high)
+    best_thresh
+}
+
+/// Tạo mặt nạ Adaptive Thresholding dựa trên Box Blur cục bộ
+fn calculate_adaptive_mask(gray: &GrayImage, radius: u32, c_offset: i32) -> GrayImage {
+    let (w, h) = gray.dimensions();
+    let channel_f32: Vec<f32> = gray.pixels().map(|p| p[0] as f32).collect();
+    let local_mean = crate::utils::color::fast_box_blur(&channel_f32, w, h, radius);
+
+    let mut mask = GrayImage::new(w, h);
+    for y in 0..h {
+        let row_offset = (y * w) as usize;
+        for x in 0..w {
+            let idx = row_offset + x as usize;
+            let orig = gray.get_pixel(x, y)[0] as i32;
+            let mean = local_mean[idx] as i32;
+            let val = if orig >= mean - c_offset { 255 } else { 0 };
+            mask.put_pixel(x, y, Luma([val]));
+        }
+    }
+    mask
 }
 
 /// Tính diện tích đa giác theo công thức Shoelace
@@ -247,7 +362,6 @@ pub fn ramer_douglas_peucker(pts: &[Point2<f32>], epsilon: f32) -> Vec<Point2<f3
         return pts.to_vec();
     }
 
-    // Với đa giác khép kín, tìm điểm xa nhất so với điểm đầu tiên
     let mut max_dist = 0.0f32;
     let mut index = 0;
     let start = pts[0];
@@ -334,7 +448,7 @@ pub fn convex_hull(points: &[Point2<f32>]) -> Vec<Point2<f32>> {
 }
 
 /// Kiểm tra tính hợp lệ của hình tứ giác phát hiện được
-fn is_valid_quadrilateral(pts: &[Point2<f32>], max_w: u32, max_h: u32) -> bool {
+pub fn is_valid_quadrilateral(pts: &[Point2<f32>], max_w: u32, max_h: u32) -> bool {
     if pts.len() != 4 {
         return false;
     }
@@ -389,7 +503,7 @@ fn is_valid_quadrilateral(pts: &[Point2<f32>], max_w: u32, max_h: u32) -> bool {
     // 3. Tỷ lệ diện tích tứ giác so với bounding box
     let area = polygon_area(pts);
     let total_area = (max_w * max_h) as f32;
-    if area < total_area * 0.05 || area > total_area * 0.98 {
+    if area < total_area * 0.05 || area > total_area * 0.99 {
         return false;
     }
 
@@ -468,30 +582,57 @@ fn scale_corners_to_original(
     )
 }
 
-/// Fallback Min Bounding Box cho tập điểm
-fn min_bounding_box(pts: &[Point2<f32>]) -> Option<[Point2<f32>; 4]> {
-    if pts.is_empty() {
+/// Tính Min Area Rect (Rotated Bounding Box) cho tập điểm
+pub fn min_area_rect(pts: &[Point2<f32>]) -> Option<[Point2<f32>; 4]> {
+    let n = pts.len();
+    if n < 3 {
         return None;
     }
 
-    let mut min_x = pts[0].x;
-    let mut max_x = pts[0].x;
-    let mut min_y = pts[0].y;
-    let mut max_y = pts[0].y;
+    let mut min_area = f32::MAX;
+    let mut best_box = [Point2::new(0.0, 0.0); 4];
 
-    for p in pts.iter().skip(1) {
-        min_x = min_x.min(p.x);
-        max_x = max_x.max(p.x);
-        min_y = min_y.min(p.y);
-        max_y = max_y.max(p.y);
+    for i in 0..n {
+        let p1 = pts[i];
+        let p2 = pts[(i + 1) % n];
+        let edge = p2 - p1;
+        let len = (edge.x * edge.x + edge.y * edge.y).sqrt();
+        if len < 1e-4 {
+            continue;
+        }
+
+        let u_x = edge.x / len;
+        let u_y = edge.y / len;
+        let v_x = -u_y;
+        let v_y = u_x;
+
+        let mut min_u = f32::MAX;
+        let mut max_u = f32::MIN;
+        let mut min_v = f32::MAX;
+        let mut max_v = f32::MIN;
+
+        for p in pts {
+            let du = p.x * u_x + p.y * u_y;
+            let dv = p.x * v_x + p.y * v_y;
+            min_u = min_u.min(du);
+            max_u = max_u.max(du);
+            min_v = min_v.min(dv);
+            max_v = max_v.max(dv);
+        }
+
+        let area = (max_u - min_u) * (max_v - min_v);
+        if area < min_area {
+            min_area = area;
+            best_box = [
+                Point2::new(u_x * min_u + v_x * min_v, u_y * min_u + v_y * min_v),
+                Point2::new(u_x * max_u + v_x * min_v, u_y * max_u + v_y * min_v),
+                Point2::new(u_x * max_u + v_x * max_v, u_y * max_u + v_y * max_v),
+                Point2::new(u_x * min_u + v_x * max_v, u_y * min_u + v_y * max_v),
+            ];
+        }
     }
 
-    Some([
-        Point2::new(min_x, min_y),
-        Point2::new(max_x, min_y),
-        Point2::new(max_x, max_y),
-        Point2::new(min_x, max_y),
-    ])
+    Some(best_box)
 }
 
 #[cfg(test)]
@@ -516,7 +657,6 @@ mod tests {
 
     #[test]
     fn test_page_detector_synthetic() {
-        // Tạo ảnh nền xám đậm 400x500
         let mut img = RgbImage::from_pixel(400, 500, Rgb([30, 30, 30]));
 
         // Vẽ trang giấy trắng ở giữa (từ x: 50..350, y: 50..450)
@@ -529,8 +669,8 @@ mod tests {
         let detector = PageDetector::new(800, 0.1);
         let (corners, conf, status) = detector.detect(&img);
 
-        assert!(status == ScanStatus::Success || status == ScanStatus::Fallback);
-        assert!(conf > 0.5);
+        assert_eq!(status, ScanStatus::Success);
+        assert!(conf >= 0.90);
 
         // Góc TL phải xấp xỉ (50, 50)
         assert!((corners.tl.x - 50.0).abs() < 10.0);
