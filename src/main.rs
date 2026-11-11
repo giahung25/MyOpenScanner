@@ -55,6 +55,10 @@ struct Args {
     /// Độ sáng mục tiêu cho nền tài liệu (0 - 255)
     #[arg(long, default_value_t = 230)]
     target_luminance: u8,
+
+    /// Tạo file PDF có lớp text ẩn cho phép bôi đen, copy và tìm kiếm (Searchable PDF)
+    #[arg(short, long, default_value_t = false)]
+    searchable_pdf: bool,
 }
 
 fn main() {
@@ -64,6 +68,7 @@ fn main() {
     config.output_dpi = args.dpi;
     config.output_format = args.format.into();
     config.target_luminance = args.target_luminance;
+    config.searchable_pdf = args.searchable_pdf;
 
     let pipeline = ScannerPipeline::new(config);
 
@@ -80,6 +85,9 @@ fn main() {
                 println!("   - Thời gian xử lý: {} ms", res.processing_time_ms);
                 if let Some(path) = &res.output_path {
                     println!("   - Đường dẫn output: {}", path);
+                }
+                if let Some(path) = &res.searchable_pdf_path {
+                    println!("   - Searchable PDF (bôi đen được): {}", path);
                 }
             }
             Err(e) => {

@@ -71,6 +71,7 @@ impl ScannerPipeline {
             target_dpi: self.config.output_dpi,
             processing_time_ms: 0,
             output_path: None,
+            searchable_pdf_path: None,
             error_message: None,
         };
 
@@ -105,6 +106,50 @@ impl ScannerPipeline {
         if let Err(e) = export_res {
             result.status = ScanStatus::Error;
             result.error_message = Some(e);
+        }
+
+        // --- BƯỚC 6 (TÙY CHỌN): TẠO SEARCHABLE PDF (Lớp text ẩn bôi đen được) ---
+        if self.config.searchable_pdf {
+            let img_path = output_base_path.with_extension("png");
+            let temp_img_created = if !img_path.exists() {
+                let _ = enhanced_img.save(&img_path);
+                true
+            } else {
+                false
+            };
+
+            let file_stem = output_base_path.file_name().unwrap_or_default().to_string_lossy();
+            let parent_dir = output_base_path.parent().unwrap_or(Path::new("."));
+            let searchable_pdf = parent_dir.join(format!("{}_searchable.pdf", file_stem));
+            let text_file = parent_dir.join(format!("{}_text.txt", file_stem));
+            let ocr_json = parent_dir.join(format!("{}_ocr.json", file_stem));
+
+            let ocr_script = Path::new("scripts/ocr_processor.py");
+            if ocr_script.exists() {
+                let cmd_res = std::process::Command::new("python")
+                    .arg(ocr_script)
+                    .arg("--image")
+                    .arg(&img_path)
+                    .arg("--output-pdf")
+                    .arg(&searchable_pdf)
+                    .arg("--output-text")
+                    .arg(&text_file)
+                    .arg("--output-json")
+                    .arg(&ocr_json)
+                    .arg("--dpi")
+                    .arg(self.config.output_dpi.to_string())
+                    .status();
+
+                if let Ok(exit_status) = cmd_res {
+                    if exit_status.success() {
+                        result.searchable_pdf_path = Some(searchable_pdf.to_string_lossy().to_string());
+                    }
+                }
+            }
+
+            if temp_img_created && !matches!(self.config.output_format, crate::models::OutputFormat::Png | crate::models::OutputFormat::Both) {
+                let _ = std::fs::remove_file(&img_path);
+            }
         }
 
         result.processing_time_ms = start_time.elapsed().as_millis() as u64;

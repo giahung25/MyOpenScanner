@@ -67,6 +67,7 @@ pub struct ScanResult {
     pub target_dpi: u32,
     pub processing_time_ms: u64,
     pub output_path: Option<String>,
+    pub searchable_pdf_path: Option<String>,
     pub error_message: Option<String>,
 }
 
@@ -112,6 +113,7 @@ pub struct PipelineConfig {
     pub barcode_sharpen_strength: f32, // Barcode region sharpen strength
     pub output_dpi: u32,              // Output PDF DPI (200/300)
     pub output_format: OutputFormat,  // Output format
+    pub searchable_pdf: bool,         // Generate searchable PDF with invisible text layer
 }
 
 impl Default for PipelineConfig {
@@ -128,6 +130,7 @@ impl Default for PipelineConfig {
             barcode_sharpen_strength: 0.3,
             output_dpi: 300,
             output_format: OutputFormat::Pdf,
+            searchable_pdf: false,
         }
     }
 }
