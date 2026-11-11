@@ -64,7 +64,7 @@ pub fn compute_inverse_homography(
     compute_homography(dst_pts, src_pts)
 }
 
-/// Warp ảnh bằng Inverse Mapping với Bilinear Interpolation
+/// Warp ảnh bằng Inverse Mapping với Bilinear Interpolation (đa luồng hóa qua Rayon)
 /// Hiệu quả hơn forward mapping vì không có lỗ hổng (holes)
 pub fn warp_perspective_bilinear(
     src: &image::RgbImage,
@@ -80,27 +80,35 @@ pub fn warp_perspective_bilinear(
 
     // Inverse homography: dst -> src
     let h_inv = homography.try_inverse().unwrap_or_else(Matrix3::identity);
+    let row_stride = (out_width * 3) as usize;
 
-    for y in 0..out_height {
-        for x in 0..out_width {
-            // Tọa độ điểm đích (đồng nhất)
-            let pt_dst = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, 1.0);
-            let pt_src_h = h_inv * pt_dst;
+    dst.par_chunks_exact_mut(row_stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y_f = y as f32 + 0.5;
+            for x in 0..out_width {
+                let x_f = x as f32 + 0.5;
+                let pt_dst = Vector3::new(x_f, y_f, 1.0);
+                let pt_src_h = h_inv * pt_dst;
 
-            if pt_src_h.z.abs() < 1e-8 {
-                // Điểm ở vô cực, dùng màu đen hoặc replicate
-                dst.put_pixel(x, y, image::Rgb([0, 0, 0]));
-                continue;
+                let offset = (x * 3) as usize;
+                if pt_src_h.z.abs() < 1e-8 {
+                    row[offset] = 0;
+                    row[offset + 1] = 0;
+                    row[offset + 2] = 0;
+                    continue;
+                }
+
+                let sx = pt_src_h.x / pt_src_h.z;
+                let sy = pt_src_h.y / pt_src_h.z;
+
+                let pixel = bilinear_sample(src, sx, sy, src_w, src_h);
+                row[offset] = pixel[0];
+                row[offset + 1] = pixel[1];
+                row[offset + 2] = pixel[2];
             }
+        });
 
-            let sx = pt_src_h.x / pt_src_h.z;
-            let sy = pt_src_h.y / pt_src_h.z;
-
-            // Bilinear interpolation
-            let pixel = bilinear_sample(src, sx, sy, src_w, src_h);
-            dst.put_pixel(x, y, pixel);
-        }
-    }
     dst
 }
 
